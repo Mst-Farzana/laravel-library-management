@@ -1,23 +1,31 @@
 <?php
 
-use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ProfileController;
 use App\Models\Book;
+use App\Models\Borrow;
 use App\Models\Category;
+use App\Models\Member;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Route;
 
 // লাইব্রেরি হোমপেজ - বইয়ের তালিকা
 Route::get('/', function () {
     $books = Book::with('category')->where('available_copies', '>', 0)->paginate(12);
+
     return view('library.home', compact('books'));
 })->name('library.home');
 
 // বইয়ের বিস্তারিত
 Route::get('/books/{id}', function ($id) {
     $book = Book::with('category')->findOrFail($id);
+
     return view('library.books.show', compact('book'));
 })->name('books.show');
 
 // বই খোঁজা (Search)
-Route::get('/search', function (\Illuminate\Http\Request $request) {
+Route::get('/search', function (Request $request) {
     $query = $request->input('query');
 
     if ($query) {
@@ -35,63 +43,77 @@ Route::get('/search', function (\Illuminate\Http\Request $request) {
 // ==========================================
 //  BORROW BOOK ROUTE (লগইন প্রয়োজন, কিন্তু Admin নয়)
 // ==========================================
-Route::middleware(['auth'])->post('/books/{id}/borrow', function ($id) {
-    $book = \App\Models\Book::findOrFail($id);
+Route::middleware(['auth'])->post('/books/{id}/borrow', function (int $id): RedirectResponse {
+    return DB::transaction(function () use ($id): RedirectResponse {
+        $book = Book::query()->lockForUpdate()->findOrFail($id);
 
-    // ১. চেক করুন বইটি available কিনা
-    if ($book->available_copies <= 0) {
-        return redirect()->back()->with('error', 'দুঃখিত, এই বইটি বর্তমানে অনুপলব্ধ।');
-    }
+        if ($book->available_copies <= 0) {
+            return redirect()->back()->with('error', 'দুঃখিত, এই বইটি বর্তমানে অনুপলব্ধ।');
+        }
 
-    // . চেক করুন ব্যবহারকারী ইতিমধ্যে এই বইটি ধার নিয়েছেন কিনা
-    $existingBorrow = \App\Models\Borrow::where('user_id', auth()->id())
-        ->where('book_id', $book->id)
-        ->where('status', 'borrowed')
-        ->first();
+        $existingBorrow = Borrow::query()
+            ->where('user_id', auth()->id())
+            ->where('book_id', $book->id)
+            ->whereIn('status', ['borrowed', 'overdue'])
+            ->exists();
 
-    if ($existingBorrow) {
-        return redirect()->back()->with('error', 'আপনি ইতিমধ্যে এই বইটি ধার নিয়েছেন।');
-    }
+        if ($existingBorrow) {
+            return redirect()->back()->with('error', 'আপনি ইতিমধ্যে এই বইটি ধার নিয়েছেন।');
+        }
 
-    // ৩. নতুন Borrow রেকর্ড তৈরি করুন
-    \App\Models\Borrow::create([
-        'user_id' => auth()->id(),
-        'book_id' => $book->id,
-        'borrow_date' => now(),
-        'due_date' => now()->addDays(14),
-        'status' => 'borrowed',
-    ]);
+        $dueDate = now()->addDays(14);
 
-    // ৪. বইয়ের available_copies ১ কমান
-    $book->decrement('available_copies');
+        Borrow::create([
+            'user_id' => auth()->id(),
+            'book_id' => $book->id,
+            'borrow_date' => now(),
+            'due_date' => $dueDate,
+            'status' => 'borrowed',
+        ]);
 
-    // ৫. যদি available_copies ০ হয়ে যায়, স্ট্যাটাস আপডেট করুন
-    if ($book->available_copies == 0) {
-        $book->update(['status' => 'unavailable']);
-    }
+        $availableCopies = $book->available_copies - 1;
+        $book->update([
+            'available_copies' => $availableCopies,
+            'status' => $availableCopies > 0 ? 'available' : 'unavailable',
+        ]);
 
-    // ৬. সফল মেসেজ
-    return redirect()->back()->with('success', ' বইটি সফলভাবে ধার নেওয়া হয়েছে! ফেরত দেওয়ার শেষ তারিখ: ' . now()->addDays(14)->format('d M, Y'));
+        return redirect()->back()->with(
+            'success',
+            'বইটি সফলভাবে ধার নেওয়া হয়েছে! ফেরত দেওয়ার শেষ তারিখ: '.$dueDate->format('d M, Y')
+        );
+    });
 })->name('books.borrow');
 
 // ==========================================
 // 📚 RETURN BOOK ROUTE (ঐচ্ছিক - ভবিষ্যতে কাজে লাগবে)
 // ==========================================
-Route::middleware(['auth'])->post('/borrows/{id}/return', function ($id) {
-    $borrow = \App\Models\Borrow::findOrFail($id);
+Route::middleware(['auth'])->post('/borrows/{id}/return', function (int $id): RedirectResponse {
+    return DB::transaction(function () use ($id): RedirectResponse {
+        $borrow = Borrow::query()->lockForUpdate()->findOrFail($id);
 
-    if ($borrow->user_id !== auth()->id()) {
-        abort(403, 'অনুমতি নেই');
-    }
+        if ($borrow->user_id !== auth()->id()) {
+            abort(403, 'অনুমতি নেই');
+        }
 
-    $borrow->update([
-        'return_date' => now(),
-        'status' => 'returned',
-    ]);
+        if ($borrow->status === 'returned') {
+            return redirect()->back()->with('error', 'এই বইটি ইতিমধ্যে ফেরত দেওয়া হয়েছে।');
+        }
 
-    $borrow->book->increment('available_copies');
+        $book = Book::query()->lockForUpdate()->findOrFail($borrow->book_id);
+        $availableCopies = min($book->total_copies, $book->available_copies + 1);
 
-    return redirect()->back()->with('success', 'বইটি সফলভাবে ফেরত দেওয়া হয়েছে!');
+        $borrow->update([
+            'return_date' => now(),
+            'status' => 'returned',
+        ]);
+
+        $book->update([
+            'available_copies' => $availableCopies,
+            'status' => $availableCopies > 0 ? 'available' : 'unavailable',
+        ]);
+
+        return redirect()->back()->with('success', 'বইটি সফলভাবে ফেরত দেওয়া হয়েছে!');
+    });
 })->name('books.return');
 
 // Admin Routes (লগইন প্রয়োজন)
@@ -101,13 +123,13 @@ Route::middleware(['auth'])->prefix('admin')->group(function () {
     Route::get('/dashboard', function () {
         $totalBooks = Book::count();
         $availableBooks = Book::where('available_copies', '>', 0)->count();
-        $issuedBooks = \App\Models\Borrow::where('status', 'borrowed')->count();
-        $totalMembers = \App\Models\Member::count();
-        $overdueBooks = \App\Models\Borrow::where('status', 'borrowed')
+        $issuedBooks = Borrow::where('status', 'borrowed')->count();
+        $totalMembers = Member::count();
+        $overdueBooks = Borrow::where('status', 'borrowed')
             ->where('due_date', '<', now())->count();
 
         // ✅ নতুন যোগ করা হয়েছে: Recent Activities
-        $recentActivities = \App\Models\Borrow::with(['book', 'user'])
+        $recentActivities = Borrow::with(['book', 'user'])
             ->latest()
             ->take(4)
             ->get();
@@ -118,18 +140,18 @@ Route::middleware(['auth'])->prefix('admin')->group(function () {
             $date = now()->subMonths($i);
             $monthName = $date->format('M');
 
-            $count = \App\Models\Borrow::whereYear('created_at', $date->year)
+            $count = Borrow::whereYear('created_at', $date->year)
                 ->whereMonth('created_at', $date->month)
                 ->count();
 
             $borrowingData[] = [
                 'month' => $monthName,
-                'count' => $count
+                'count' => $count,
             ];
         }
 
         // ✅ নতুন যোগ করা হয়েছে: Category Data for Chart
-        $categoryData = \App\Models\Book::select('category_id', \Illuminate\Support\Facades\DB::raw('count(*) as count'))
+        $categoryData = Book::select('category_id', DB::raw('count(*) as count'))
             ->groupBy('category_id')
             ->with('category')
             ->get();
@@ -149,16 +171,18 @@ Route::middleware(['auth'])->prefix('admin')->group(function () {
 
     // Books Management
     Route::get('/books', function () {
-        $books = \App\Models\Book::with('category')->paginate(15);
+        $books = Book::with('category')->paginate(15);
+
         return view('admin.books.index', compact('books'));
     })->name('admin.books.index');
 
     Route::get('/books/create', function () {
         $categories = Category::all();
+
         return view('admin.books.create', compact('categories'));
     })->name('admin.books.create');
 
-    Route::post('/books', function (\Illuminate\Http\Request $request) {
+    Route::post('/books', function (Request $request) {
         $validated = $request->validate([
             'title' => 'required|string|max:255',
             'author' => 'required|string|max:255',
@@ -167,7 +191,7 @@ Route::middleware(['auth'])->prefix('admin')->group(function () {
             'publisher' => 'required|string|max:255',
             'published_year' => 'required|integer',
             'total_copies' => 'required|integer|min:1',
-            'available_copies' => 'required|integer|min:0',
+            'available_copies' => 'required|integer|min:0|lte:total_copies',
             'description' => 'nullable|string',
             'shelf_location' => 'nullable|string',
         ]);
@@ -180,23 +204,24 @@ Route::middleware(['auth'])->prefix('admin')->group(function () {
     })->name('admin.books.store');
 
     Route::get('/books/{id}/edit', function ($id) {
-        $book = \App\Models\Book::findOrFail($id);
-        $categories = \App\Models\Category::all();
+        $book = Book::findOrFail($id);
+        $categories = Category::all();
+
         return view('admin.books.edit', compact('book', 'categories'));
     })->name('admin.books.edit');
 
-    Route::put('/books/{id}', function ($id, \Illuminate\Http\Request $request) {
-        $book = \App\Models\Book::findOrFail($id);
+    Route::put('/books/{id}', function ($id, Request $request) {
+        $book = Book::findOrFail($id);
 
         $validated = $request->validate([
             'title' => 'required|string|max:255',
             'author' => 'required|string|max:255',
-            'isbn' => 'required|unique:books,isbn,' . $book->id,
+            'isbn' => 'required|unique:books,isbn,'.$book->id,
             'category_id' => 'required|exists:categories,id',
             'publisher' => 'required|string|max:255',
             'published_year' => 'required|integer',
             'total_copies' => 'required|integer|min:1',
-            'available_copies' => 'required|integer|min:0',
+            'available_copies' => 'required|integer|min:0|lte:total_copies',
             'description' => 'nullable|string',
             'shelf_location' => 'nullable|string',
         ]);
@@ -210,13 +235,15 @@ Route::middleware(['auth'])->prefix('admin')->group(function () {
 
     // Members Management
     Route::get('/members', function () {
-        $members = \App\Models\Member::paginate(10);
+        $members = Member::paginate(10);
+
         return view('admin.member.index', compact('members'));
     })->name('admin.members.index');
 
     // Borrow/Return Management
     Route::get('/borrows', function () {
-        $borrows = \App\Models\Borrow::with(['book', 'member', 'user'])->latest()->paginate(15);
+        $borrows = Borrow::with(['book', 'member', 'user'])->latest()->paginate(15);
+
         return view('admin.borrow.index', compact('borrows'));
     })->name('admin.borrows.index');
 });
@@ -225,5 +252,11 @@ Route::middleware(['auth'])->prefix('admin')->group(function () {
 Route::get('/dashboard', function () {
     return view('dashboard');
 })->middleware(['auth'])->name('dashboard');
+
+Route::middleware('auth')->group(function () {
+    Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
+    Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
+    Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
+});
 
 require __DIR__.'/auth.php';

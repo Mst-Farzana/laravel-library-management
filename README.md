@@ -53,6 +53,10 @@ In order to ensure that the Laravel community is welcoming to all, please review
 
 If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
 
+## Render Deployment
+
+The Docker image builds the Vite assets and serves the application on port `10000`. Configure `APP_KEY`, `APP_URL`, `APP_ENV=production`, `APP_DEBUG=false`, and the `DB_*` connection variables in Render's environment settings. The image does not run database migrations automatically; run `php artisan migrate --force` after configuring the production database and before serving traffic.
+
 ## License
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
